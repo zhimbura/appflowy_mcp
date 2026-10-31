@@ -1095,15 +1095,42 @@ fn init_tracing() {
 
 /// MCP server over stdio (the `appflowy-mcp` entry point). stdout is the
 /// protocol channel — every log line must go to stderr.
+/// MCP server authentication: env credentials first (as before), else the
+/// session saved by `appflowy login`. Returns true when a saved session was
+/// used, so the caller persists the rotated refresh token on exit.
+async fn authenticate_server(server: &AppServer) -> bool {
+    if server.client.email().await.is_some() && server.client.password().await.is_some() {
+        server.warm_login().await;
+        return false;
+    }
+    if !load_credentials(&server.client).await {
+        server.warm_login().await;
+        return false;
+    }
+    // GoTrue rotates refresh tokens: refresh now and persist the new one, so
+    // the next start does not find a stale token in the credentials file.
+    match server.client.refresh_token_with(None).await {
+        Ok(_) => match save_credentials(&server.client).await {
+            Ok(()) => tracing::info!("restored the session saved by `appflowy login`"),
+            Err(e) => tracing::warn!("session restored but not saved back: {e}"),
+        },
+        Err(e) => tracing::warn!("saved session could not be refreshed, run `appflowy login`: {e}"),
+    }
+    true
+}
+
 pub async fn serve() -> anyhow::Result<()> {
     init_tracing();
 
     dotenvy::dotenv().ok();
     let server = AppServer::from_env();
-    server.warm_login().await;
+    let stored = authenticate_server(&server).await;
 
-    let service = server.serve(stdio()).await?;
+    let service = server.clone().serve(stdio()).await?;
     service.waiting().await?;
+    if stored {
+        let _ = save_credentials(&server.client).await;
+    }
     Ok(())
 }
 
@@ -1133,7 +1160,7 @@ async fn serve_http(addr: &str, allow_remote: bool) -> anyhow::Result<()> {
 
     dotenvy::dotenv().ok();
     let server = AppServer::from_env();
-    server.warm_login().await;
+    let stored = authenticate_server(&server).await;
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let local = listener.local_addr()?;
@@ -1143,6 +1170,9 @@ async fn serve_http(addr: &str, allow_remote: bool) -> anyhow::Result<()> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await?;
+    if stored {
+        let _ = save_credentials(&server.client).await;
+    }
     Ok(())
 }
 
